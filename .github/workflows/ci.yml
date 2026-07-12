@@ -1,0 +1,34 @@
+name: CI
+
+# Runs the full test suite (server regression + api/cli/ctl/web e2e) on every
+# push and pull request. The ctl and api suites drive real tmux sessions, so
+# tmux is installed on the runner.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['18', '20', '22']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install tmux (needed by the chess-ctl e2e suite)
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Install server dependency (chess.js)
+        run: npm --prefix chess-app/server ci
+
+      - name: Run tests
+        run: npm test

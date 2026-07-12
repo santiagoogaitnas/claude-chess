@@ -1,0 +1,25 @@
+{
+  "name": "chess-app-server",
+  "version": "1.0.0",
+  "description": "Chess bridge server: web UI <-> tmux-injected Claude opponent",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test.mjs"
+  },
+  "keywords": [
+    "chess",
+    "claude",
+    "chess.js",
+    "tmux"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "chess.js": "^1.4.0"
+  }
+}

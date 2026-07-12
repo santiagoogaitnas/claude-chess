@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chess vs Claude</title>
+  <meta name="description" content="Play chess in your browser against a live Claude Code session — the server referees every move with chess.js.">
+  <meta name="theme-color" content="#1c1b19">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%237fb069'/%3E%3Ctext x='16' y='25' font-size='24' text-anchor='middle' fill='%231c1b19'%3E%E2%99%9E%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="layout">
+    <section class="board-panel">
+      <div class="status-bar" id="status-bar" role="status" aria-live="polite" aria-atomic="true">Connecting…</div>
+      <div class="captured" id="captured-top" aria-label="Pieces you have captured"></div>
+      <div class="board-wrap">
+        <div class="board" id="board" role="grid" aria-label="Chess board"></div>
+      </div>
+      <div class="captured" id="captured-bottom" aria-label="Pieces Claude has captured"></div>
+      <div class="draw-banner" id="draw-banner" role="alert" hidden>
+        <span>Claude offers a draw.</span>
+        <button id="draw-accept">Accept</button>
+        <button id="draw-decline" class="danger">Decline</button>
+      </div>
+      <div class="nudge-banner" id="nudge-banner" role="alert" hidden>
+        <span>Claude hasn't moved in a while — the prompt may have been lost.</span>
+        <button id="nudge">Nudge Claude</button>
+      </div>
+      <div class="error-bar" id="error-bar" role="alert" aria-live="assertive" hidden></div>
+    </section>
+
+    <aside class="side-panel">
+      <h1>Chess <span class="vs">vs</span> Claude
+        <button id="sound-toggle" class="sound-toggle" type="button" title="Toggle sounds" aria-label="Toggle sounds">🔊</button>
+      </h1>
+      <div class="controls">
+        <button id="new-white">New game as White</button>
+        <button id="new-black">New game as Black</button>
+        <button id="takeback">Take back move</button>
+        <button id="offer-draw">Offer draw</button>
+        <a id="download-pgn" class="button-link" href="/api/pgn" download="chess-vs-claude.pgn">Download PGN</a>
+        <button id="resign" class="danger">Resign</button>
+        <button id="quit" class="danger">End session</button>
+      </div>
+      <h2>Moves</h2>
+      <p class="history-hint">Click a move or use ← → to review; End returns to the game.</p>
+      <ol class="history" id="history"></ol>
+    </aside>
+  </main>
+
+  <div class="promo-overlay" id="promo-overlay" role="dialog" aria-modal="true" aria-label="Choose promotion piece" hidden>
+    <div class="promo-box">
+      <p>Promote to:</p>
+      <div class="promo-choices" id="promo-choices"></div>
+    </div>
+  </div>
+
+  <script src="board.js"></script>
+</body>
+</html>

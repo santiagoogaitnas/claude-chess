@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+#
+# chess-ctl — lifecycle bridge between a Claude session and the chess server.
+#
+# Run this from INSIDE the tmux pane where claude is running (the /chess skill
+# does exactly that): $TMUX_PANE is captured automatically so the server knows
+# where to inject move prompts via `tmux send-keys`.
+#
+#   chess-ctl start [--pane <tmux-target>] [--port <n>] [--no-open]
+#   chess-ctl stop
+#   chess-ctl restart [start options]
+#   chess-ctl status
+#   chess-ctl log [n|-f]     # tail last n lines of the server log (default 40; -f follows)
+#
+# Env: CHESS_PORT (default 3456) — must match what the UI/CLI use.
+# Files: chess-app/.run/{server.pid,server.log,pane,port}
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="$(dirname "$BIN_DIR")"
+RUN_DIR="$APP_DIR/.run"
+PID_FILE="$RUN_DIR/server.pid"
+LOG_FILE="$RUN_DIR/server.log"
+PANE_FILE="$RUN_DIR/pane"
+PORT_FILE="$RUN_DIR/port"
+
+# True when <pid> is a process running THIS clone's server.mjs. Session names
+# and recycled pids alone can collide with another checkout's game (test
+# suites run isolated copies concurrently) — the absolute script path can't.
+is_our_server() {
+  case "$(ps -p "$1" -o command= 2>/dev/null)" in
+    *"$APP_DIR/server/server.mjs"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# True when the chess-server-<PORT> tmux session exists AND hosts our server.
+session_ours() {
+  local p
+  p="$(tmux display-message -pt "chess-server-$PORT" '#{pane_pid}' 2>/dev/null)" || return 1
+  is_our_server "$p"
+}
+# Port resolution: explicit CHESS_PORT wins; otherwise the port the running
+# server was started with (.run/port); otherwise the default. This keeps
+# stop/status/log pointed at the right server after `start --port N`.
+if [ -n "${CHESS_PORT:-}" ]; then
+  PORT="$CHESS_PORT"
+elif [ -f "$PORT_FILE" ]; then
+  PORT="$(cat "$PORT_FILE")"
+else
+  PORT=3456
+  # .run/ may have been wiped while the server lives on in its detached tmux
+  # session. If exactly one chess-server-<n> session hosting THIS clone's
+  # server exists, adopt its port so status/stop/start find the survivor
+  # instead of defaulting blind.
+  if command -v tmux >/dev/null 2>&1; then
+    discovered="" n_discovered=0
+    for cand in $(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+                    | sed -n 's/^chess-server-\([0-9]\{1,\}\)$/\1/p'); do
+      cand_pid="$(tmux display-message -pt "chess-server-$cand" '#{pane_pid}' 2>/dev/null)" || continue
+      is_our_server "$cand_pid" || continue
+      discovered="$cand" n_discovered=$((n_discovered + 1))
+    done
+    [ "$n_discovered" -eq 1 ] && PORT="$discovered"
+    unset discovered n_discovered cand cand_pid
+  fi
+fi
+BASE_URL="http://127.0.0.1:$PORT"
+
+server_pid() {
+  [ -f "$PID_FILE" ] || return 1
+  local pid
+  pid="$(cat "$PID_FILE")"
+  kill -0 "$pid" 2>/dev/null || return 1
+  # Stale-pid-file guard: after a reboot (or a crash that left .run behind)
+  # the OS may hand this pid to an unrelated process; only trust it if it is
+  # still our node server, otherwise stop/reap would kill an innocent process.
+  is_our_server "$pid" || return 1
+  echo "$pid"
+}
+
+api_up() { curl -sf -m 2 "$BASE_URL/api/state" >/dev/null 2>&1; }
+
+# True only when the live pid we track was started for THIS port. A live pid
+# plus a responding $PORT is not proof of ownership: our instance may be on
+# another port while something foreign answers on this one.
+owns_port() { server_pid >/dev/null && [ "$(cat "$PORT_FILE" 2>/dev/null || true)" = "$PORT" ]; }
+
+# Strict pane liveness: `display-message -pt <target>` returns 0 for dead
+# pane-ids on some tmux versions, so match against the real pane list.
+pane_alive() {
+  tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$1" && return 0
+  # Non-%id targets (session:win.pane names) won't match the id list; for
+  # those fall back to asking tmux to resolve the target.
+  case "$1" in %*) return 1 ;; esac
+  tmux display-message -pt "$1" '#{pane_id}' >/dev/null 2>&1
+}
+
+# A wiped .run/ leaves a live server unowned on paper: the detached tmux
+# session's name is the surviving proof it is ours (same proof cmd_stop
+# accepts). Rebuild pid/port/pane from the session + /api/state so start and
+# status recognize the server instead of calling it foreign / not running.
+recover_run_files() {
+  owns_port && return 0
+  api_up || return 1
+  session_ours || return 1
+  local pid pane
+  pid="$(tmux display-message -pt "chess-server-$PORT" '#{pane_pid}' 2>/dev/null)" || return 1
+  pane="$(curl -sf -m 2 "$BASE_URL/api/state" | node -e '
+    const c=[];process.stdin.on("data",d=>c.push(d)).on("end",()=>{
+      process.stdout.write(JSON.parse(c.join("")).tmuxTarget||"")});' 2>/dev/null || true)"
+  mkdir -p "$RUN_DIR"
+  echo "$pid" > "$PID_FILE"
+  printf '%s' "$PORT" > "$PORT_FILE"
+  printf '%s' "$pane" > "$PANE_FILE"
+  echo "note: recovered .run state for the running server on :$PORT (pid $pid)" >&2
+}
+
+# Fresh clones have no server/node_modules; the server would die on import
+# with ERR_MODULE_NOT_FOUND. Install deps once before first start.
+ensure_deps() {
+  command -v node >/dev/null 2>&1 || { echo "error: node not found on PATH" >&2; exit 1; }
+  [ -e "$APP_DIR/server/node_modules/chess.js" ] && return 0
+  command -v npm >/dev/null 2>&1 || {
+    echo "error: server dependencies missing and npm not found — run 'npm install' in $APP_DIR/server" >&2
+    exit 1
+  }
+  echo "installing server dependencies (first run)..." >&2
+  (cd "$APP_DIR/server" && npm install --no-fund --no-audit --loglevel=error) || {
+    echo "error: npm install failed in $APP_DIR/server" >&2
+    exit 1
+  }
+}
+
+cmd_start() {
+  local pane="${TMUX_PANE:-}" open_browser=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pane) pane="$2"; shift 2 ;;
+      --port)
+        case "$2" in (''|*[!0-9]*) echo "error: --port expects a number, got '$2'" >&2; exit 2 ;; esac
+        PORT="$2"; BASE_URL="http://127.0.0.1:$PORT"; shift 2 ;;
+      --no-open) open_browser=0; shift ;;
+      *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  recover_run_files || true
+  if owns_port && api_up; then
+    echo "already running (pid $(server_pid)) — $BASE_URL"
+    # A different pane was requested (or we're in a new tmux pane) but the
+    # server keeps its injection target for its whole lifetime — say so
+    # instead of silently ignoring the new target.
+    local live_pane
+    live_pane="$(cat "$PANE_FILE" 2>/dev/null || true)"
+    if [ -n "$pane" ] && [ "$pane" != "$live_pane" ]; then
+      echo "note: server injects into '${live_pane:-"(none)"}', not '$pane' — run 'chess-ctl restart --pane $pane' to retarget" >&2
+    fi
+    return 0
+  fi
+
+  # Something we don't own is already answering on this port (no live pid of
+  # ours for THIS port): launching would just die with EADDRINUSE, so bail
+  # with a clear hint. Note owns_port, not server_pid: our instance may be
+  # alive on a different port while a foreign server holds this one.
+  if ! owns_port && api_up; then
+    echo "error: a server is already responding on $BASE_URL but it wasn't started by chess-ctl" >&2
+    echo "       stop it, or pick another port: chess-ctl start --port <n>" >&2
+    exit 1
+  fi
+
+  ensure_deps
+
+  # A previous instance may be alive on a different port (start --port N after
+  # a default-port run). Writing new pid/port files below would orphan it, so
+  # reap it first.
+  local old_pid old_port
+  if old_pid="$(server_pid)"; then
+    old_port="$(cat "$PORT_FILE" 2>/dev/null || true)"
+    if [ -n "$old_port" ] && [ "$old_port" != "$PORT" ]; then
+      echo "stopping previous instance on port $old_port (pid $old_pid)" >&2
+      curl -sf -m 2 -X POST "http://127.0.0.1:$old_port/api/shutdown" >/dev/null 2>&1 || true
+      sleep 0.3
+      kill "$old_pid" 2>/dev/null || true
+      tmux kill-session -t "chess-server-$old_port" 2>/dev/null || true
+    fi
+  fi
+
+  if [ -n "$pane" ]; then
+    if ! pane_alive "$pane"; then
+      echo "warning: tmux pane '$pane' not found — starting in manual mode" >&2
+      pane=""
+    fi
+  else
+    echo "warning: not inside tmux and no --pane given — starting in manual mode" >&2
+    echo "         (moves won't be injected into Claude; use 'node $APP_DIR/server/claude.mjs state' to poll)" >&2
+  fi
+
+  mkdir -p "$RUN_DIR"
+  # The server log is append-only across restarts; rotate once it gets big so
+  # long-lived setups don't grow it unbounded (one .1 generation is plenty).
+  if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 524288 ]; then
+    mv "$LOG_FILE" "$LOG_FILE.1"
+  fi
+  printf '%s' "$pane" > "$PANE_FILE"
+  printf '%s' "$PORT" > "$PORT_FILE"
+  # Host the server in its own detached tmux session so it outlives the shell
+  # that started it (Claude's Bash tool reaps plain background children).
+  if command -v tmux >/dev/null 2>&1 && tmux start-server 2>/dev/null; then
+    local sess="chess-server-$PORT"
+    tmux kill-session -t "$sess" 2>/dev/null || true
+    # Forward CHESS_RESUME explicitly: the detached tmux session does not
+    # inherit this shell's environment, so `CHESS_RESUME=0 chess-ctl start`
+    # would otherwise be silently ignored.
+    tmux new-session -d -s "$sess" \
+      "CHESS_PORT='$PORT' CHESS_TMUX_TARGET='$pane' CHESS_RESUME='${CHESS_RESUME:-1}' exec node '$APP_DIR/server/server.mjs' >> '$LOG_FILE' 2>&1"
+    tmux display-message -pt "$sess" '#{pane_pid}' > "$PID_FILE"
+  else
+    CHESS_PORT="$PORT" CHESS_TMUX_TARGET="$pane" \
+      nohup node "$APP_DIR/server/server.mjs" >> "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+  fi
+
+  local i
+  for i in $(seq 1 25); do
+    api_up && break
+    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      echo "server died on startup — last log lines:" >&2
+      tail -n 15 "$LOG_FILE" >&2
+      exit 1
+    fi
+    sleep 0.2
+  done
+  api_up || { echo "server not responding on $BASE_URL after 5s" >&2; exit 1; }
+
+  echo "chess server up: $BASE_URL (pid $(cat "$PID_FILE"))"
+  echo "tmux target: ${pane:-"(none — manual mode)"}"
+  if [ "$open_browser" = 1 ]; then
+    if command -v open >/dev/null 2>&1; then open "$BASE_URL" || true
+    elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$BASE_URL" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+cmd_stop() {
+  local pid stopped=0
+  recover_run_files || true
+  # Ownership guard, symmetric with start's: never shut down a server we did
+  # not launch (another clone's game on the shared default port, or a foreign
+  # process behind an explicit CHESS_PORT). A wiped .run/ is still recoverable:
+  # the detached tmux session hosting this clone's server.mjs proves ownership.
+  if api_up && ! owns_port && ! session_ours; then
+    echo "error: a server answers on $BASE_URL but it wasn't started by this chess-ctl — leaving it untouched" >&2
+    echo "       stop it yourself (curl -X POST $BASE_URL/api/shutdown) or point CHESS_PORT at your instance" >&2
+    exit 1
+  fi
+  if api_up; then
+    curl -sf -m 2 -X POST "$BASE_URL/api/shutdown" >/dev/null 2>&1 || true
+    sleep 0.3
+    stopped=1
+  fi
+  if pid="$(server_pid)"; then
+    kill "$pid" 2>/dev/null || true
+    sleep 0.2
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    stopped=1
+  fi
+  if tmux kill-session -t "chess-server-$PORT" 2>/dev/null; then stopped=1; fi
+  rm -f "$PID_FILE" "$PANE_FILE" "$PORT_FILE"
+  # Report what actually happened: files are cleaned either way, but "stopped"
+  # when nothing was running would mask a server that already died.
+  if [ "$stopped" = 1 ]; then
+    echo "chess server stopped."
+  else
+    echo "no chess server was running (state files cleaned)."
+  fi
+}
+
+cmd_status() {
+  local pid pane
+  recover_run_files || true
+  if pid="$(server_pid)" && api_up; then
+    echo "running (pid $pid) — $BASE_URL"
+    # Injection health: the server keeps sending to its startup pane even if
+    # that pane has since died — surface that here instead of failing silently.
+    pane="$(cat "$PANE_FILE" 2>/dev/null || true)"
+    if [ -z "$pane" ]; then
+      echo "tmux target: (none — manual mode)"
+    elif pane_alive "$pane"; then
+      echo "tmux target: $pane (alive)"
+    else
+      echo "tmux target: $pane (DEAD — moves are not reaching Claude)"
+      echo "  fix: run 'chess-ctl restart' from Claude's pane, or 'chess-ctl restart --pane <target>'"
+    fi
+    curl -sf -m 2 "$BASE_URL/api/state" | node -e '
+      const c=[];process.stdin.on("data",d=>c.push(d)).on("end",()=>{
+        const s=JSON.parse(c.join(""));
+        console.log(`turn: ${s.turn==="w"?"White":"Black"} | claude: ${s.claudeColor==="w"?"White":"Black"} | status: ${s.status}${s.awaitingClaude?" | awaiting move from Claude":""}`);
+        if(s.drawOfferBy) console.log(`draw offer pending from ${s.drawOfferBy===s.claudeColor?"Claude":"you"} — claude.mjs draw accept|decline / POST /api/draw`);
+        console.log(`fen: ${s.fen}`);
+        if(s.history?.length) console.log(`moves: ${s.history.join(" ")}`);
+        if(s.lastError){const e=s.lastError.split("\n")[0];console.log(`last error: ${e.length>160?e.slice(0,160)+"…":e}`);}
+      });'
+  else
+    echo "not running"
+    return 1
+  fi
+}
+
+cmd_log() {
+  if [ "${1:-}" = "-f" ]; then
+    [ -f "$LOG_FILE" ] || { echo "(no log yet)"; return 0; }
+    exec tail -f "$LOG_FILE"
+  fi
+  tail -n "${1:-40}" "$LOG_FILE" 2>/dev/null || echo "(no log yet)"
+}
+
+cmd_restart() {
+  # Keep the injection target across the bounce: stop deletes the pane file,
+  # and a restart issued from outside the claude pane has no $TMUX_PANE.
+  local saved_pane
+  saved_pane="$(cat "$PANE_FILE" 2>/dev/null || true)"
+  cmd_stop
+  if [ -z "${TMUX_PANE:-}" ] && [ -n "$saved_pane" ]; then
+    TMUX_PANE="$saved_pane" cmd_start "$@"
+  else
+    cmd_start "$@"
+  fi
+}
+
+case "${1:-}" in
+  start) shift; cmd_start "$@" ;;
+  stop) cmd_stop ;;
+  restart) shift; cmd_restart "$@" ;;
+  status) cmd_status ;;
+  log) shift || true; cmd_log "${1:-40}" ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

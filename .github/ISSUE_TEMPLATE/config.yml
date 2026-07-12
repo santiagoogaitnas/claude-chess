@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Setup help (run this first)
+    url: https://github.com/santiagoogaitnas/claude-chess/blob/main/README.md#not-sure-you-have-everything-let-claude-set-it-up
+    about: "Not sure you have everything? Run `chess-app/bin/chess-doctor --fix` — it checks and installs what's missing before you file an issue."

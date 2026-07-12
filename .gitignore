@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Runtime state (pid/pane/port files, game snapshots, server log)
+chess-app/.run/
+
+# Swirl agent coordination (local orchestration state, not part of the app)
+.swirl/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Secrets / local env — never commit these to a public repo
+.env
+.env.*
+*.pem
+*.key

@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+#
+# chess-doctor — one command that checks (and optionally fixes) everything you
+# need to play chess against Claude. Run this first if you're not sure whether
+# your machine is set up, or which command does what.
+#
+#   chess-doctor            # check-only: report what's ready and what's missing
+#   chess-doctor --fix      # check, then fix what's safe to fix automatically
+#                           #   (install server deps, install the /chess skill)
+#   chess-doctor -h|--help
+#
+# It never changes anything unless you pass --fix. On success it prints the
+# exact next command to start a game.
+#
+# Env: CHESS_PORT (default 3456), CLAUDE_CONFIG_DIR (overrides ~/.claude).
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="$(dirname "$BIN_DIR")"
+REPO_ROOT="$(dirname "$APP_DIR")"
+SERVER_DIR="$APP_DIR/server"
+PORT="${CHESS_PORT:-3456}"
+SKILL_DEST="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/chess/SKILL.md"
+
+FIX=0
+case "${1:-}" in
+  --fix)        FIX=1 ;;
+  -h|--help)    sed -n '2,15p' "${BASH_SOURCE[0]}" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
+  "")           ;;
+  *)            echo "chess-doctor: unknown argument '$1' (try --help)" >&2; exit 2 ;;
+esac
+
+# ---- pretty output -----------------------------------------------------------
+if [ -t 1 ]; then
+  G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; B=$'\033[1m'; Z=$'\033[0m'
+else
+  G=""; Y=""; R=""; B=""; Z=""
+fi
+FAILS=0; WARNS=0
+pass() { printf '  %s✓%s %s\n'  "$G" "$Z" "$1"; }
+warn() { printf '  %s!%s %s\n'  "$Y" "$Z" "$1"; WARNS=$((WARNS + 1)); }
+fail() { printf '  %s✗%s %s\n'  "$R" "$Z" "$1"; FAILS=$((FAILS + 1)); }
+info() { printf '      %s\n' "$1"; }
+
+printf '%schess-doctor%s — checking your setup (port %s)\n\n' "$B" "$Z" "$PORT"
+
+# ---- required: node ----------------------------------------------------------
+printf '%sRequired%s\n' "$B" "$Z"
+if command -v node >/dev/null 2>&1; then
+  ver="$(node -v)"                 # e.g. v20.11.0
+  major="${ver#v}"; major="${major%%.*}"
+  if [ "${major:-0}" -ge 18 ] 2>/dev/null; then
+    pass "node $ver"
+  else
+    fail "node $ver is too old — need v18 or newer"
+    info "Install a current Node: https://nodejs.org  (or: brew install node)"
+  fi
+else
+  fail "node not found — the server and Claude's CLI both need it"
+  info "Install Node 18+: https://nodejs.org  (or: brew install node)"
+fi
+
+# ---- required: npm (for installing the one server dependency) ----------------
+if command -v npm >/dev/null 2>&1; then
+  pass "npm $(npm -v)"
+else
+  fail "npm not found — needed once to install the server's chess.js dependency"
+  info "npm ships with Node; installing Node (above) provides it"
+fi
+
+# ---- required: server dependency (chess.js) ----------------------------------
+if [ -e "$SERVER_DIR/node_modules/chess.js" ]; then
+  pass "server dependency chess.js installed"
+elif [ "$FIX" -eq 1 ] && command -v npm >/dev/null 2>&1; then
+  info "installing server dependency (chess.js)…"
+  if (cd "$SERVER_DIR" && npm install --no-fund --no-audit --loglevel=error); then
+    pass "server dependency chess.js installed (--fix)"
+  else
+    fail "npm install failed in $SERVER_DIR"
+  fi
+else
+  warn "server dependency chess.js not installed yet"
+  if [ "$FIX" -eq 1 ]; then
+    info "can't auto-install without npm — install Node 18+ first, then re-run --fix"
+  else
+    info "auto-installs on first 'chess-ctl start', or run: chess-doctor --fix"
+  fi
+fi
+
+# ---- recommended -------------------------------------------------------------
+printf '\n%sRecommended%s\n' "$B" "$Z"
+
+# curl — chess-ctl uses it for health checks and manual API calls.
+if command -v curl >/dev/null 2>&1; then
+  pass "curl (used for health checks)"
+else
+  warn "curl not found — chess-ctl uses it to confirm the server is up"
+fi
+
+# tmux — enables live move injection into Claude's pane. Without it, manual mode.
+if command -v tmux >/dev/null 2>&1; then
+  if [ -n "${TMUX:-}" ]; then
+    pass "tmux — and you're inside a session (live move injection available)"
+  else
+    warn "tmux installed but this shell is NOT inside a session"
+    info "Start one so Claude gets your moves automatically:  tmux new -s chess"
+    info "(without tmux, /chess falls back to manual polling mode — still works)"
+  fi
+else
+  warn "tmux not found — /chess will run in manual-polling mode"
+  info "For hands-free move relay:  brew install tmux   (then: tmux new -s chess)"
+fi
+
+# browser opener — chess-ctl auto-opens the board with `open`/`xdg-open`.
+if command -v open >/dev/null 2>&1 || command -v xdg-open >/dev/null 2>&1; then
+  pass "a browser opener is available (the board opens automatically)"
+else
+  warn "no browser opener found — chess-ctl can't pop the board for you"
+  info "Not a problem: just open  http://localhost:$PORT  in your browser by hand"
+fi
+
+# ---- environment: is the port free? -----------------------------------------
+printf '\n%sEnvironment%s\n' "$B" "$Z"
+# Distinguish OUR server (its /api/state returns JSON with a claudeColor field)
+# from any other program that happens to answer 200 on this port.
+port_state="free"
+if command -v curl >/dev/null 2>&1; then
+  body="$(curl -sf -m 2 "http://127.0.0.1:$PORT/api/state" 2>/dev/null || true)"
+  if [ -n "$body" ]; then
+    case "$body" in
+      *'"claudeColor"'*) port_state="chess" ;;
+      *)                 port_state="foreign" ;;
+    esac
+  fi
+fi
+if [ "$port_state" = "free" ] && command -v lsof >/dev/null 2>&1 \
+   && lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  port_state="foreign"
+fi
+if [ "$port_state" = "chess" ]; then
+  pass "a chess server is already answering on port $PORT (a game may be live)"
+  info "Reuse it, or stop it with:  chess-app/bin/chess-ctl stop"
+elif [ "$port_state" = "foreign" ]; then
+  warn "port $PORT is in use by another program"
+  info "Pick a different port:  export CHESS_PORT=3457   (then start the game)"
+else
+  pass "port $PORT is free"
+fi
+
+# ---- the /chess skill --------------------------------------------------------
+printf '\n%sThe /chess command%s\n' "$B" "$Z"
+if [ -f "$REPO_ROOT/.claude/skills/chess/SKILL.md" ]; then
+  pass "/chess works in Claude sessions launched inside this repo"
+else
+  fail "repo skill missing: $REPO_ROOT/.claude/skills/chess/SKILL.md"
+fi
+if [ -f "$SKILL_DEST" ]; then
+  pass "/chess also installed globally (works from any Claude session)"
+elif [ "$FIX" -eq 1 ]; then
+  info "installing /chess globally so it works from any session…"
+  if "$BIN_DIR/install-skill"; then
+    pass "/chess installed globally (--fix)"
+  else
+    warn "global skill install failed — /chess still works from inside this repo"
+  fi
+else
+  warn "/chess not installed globally (only works from inside this repo)"
+  info "To use it from any session:  chess-app/bin/install-skill   (or --fix)"
+fi
+
+# ---- verdict -----------------------------------------------------------------
+printf '\n%s──────────────────────────────────────%s\n' "$B" "$Z"
+if [ "$FAILS" -gt 0 ]; then
+  printf '%s✗ Not ready yet%s — %d required item(s) missing above.\n' "$R" "$Z" "$FAILS"
+  [ "$FIX" -eq 0 ] && printf 'Fix what can be automated:  chess-app/bin/chess-doctor --fix\n'
+  exit 1
+fi
+
+if [ "$WARNS" -gt 0 ]; then
+  printf '%s✓ Ready to play%s (%d optional item(s) noted above).\n' "$G" "$Z" "$WARNS"
+else
+  printf '%s✓ Everything looks good — ready to play!%s\n' "$G" "$Z"
+fi
+printf '\nStart a game:\n'
+printf '  • In a Claude session (inside tmux):  say  %s/chess%s\n' "$B" "$Z"
+printf '  • Or manually:                        chess-app/bin/chess-ctl start\n'
+printf '  Then open  http://localhost:%s\n' "$PORT"
+exit 0

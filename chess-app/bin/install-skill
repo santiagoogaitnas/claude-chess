@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+#
+# install-skill — publish the /chess skill globally so it works from ANY
+# Claude Code session, not just ones launched inside this repo.
+#
+# Copies .claude/skills/chess/SKILL.md to the user-level skills directory
+# with a preamble baked in that points at this repo's absolute path (the
+# skill's commands are written relative to the repo root).
+#
+#   install-skill              # install/update ~/.claude/skills/chess/SKILL.md
+#   install-skill --uninstall  # remove it (only if we installed it)
+#
+# Env: CLAUDE_CONFIG_DIR overrides ~/.claude (used by tests).
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$(dirname "$BIN_DIR")")"
+SRC="$REPO_ROOT/.claude/skills/chess/SKILL.md"
+DEST_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/chess"
+DEST="$DEST_DIR/SKILL.md"
+MARKER="<!-- installed by chess-app/bin/install-skill -->"
+
+die() { echo "install-skill: $*" >&2; exit 1; }
+
+if [[ "${1:-}" == "--uninstall" ]]; then
+  if [[ ! -f "$DEST" ]]; then
+    echo "nothing to uninstall ($DEST not found)"
+    exit 0
+  fi
+  grep -qF "$MARKER" "$DEST" \
+    || die "$DEST was not installed by this script — refusing to remove it"
+  rm "$DEST"
+  rmdir "$DEST_DIR" 2>/dev/null || true
+  echo "uninstalled $DEST"
+  exit 0
+fi
+[[ $# -gt 0 ]] && die "usage: install-skill [--uninstall]"
+
+[[ -f "$SRC" ]] || die "source skill not found: $SRC"
+mkdir -p "$DEST_DIR"
+
+if [[ -f "$DEST" ]] && ! grep -qF "$MARKER" "$DEST"; then
+  die "$DEST exists but was not installed by this script — refusing to overwrite"
+fi
+
+# Copy the skill, injecting a repo-location preamble right after the YAML
+# frontmatter (the block between the first two '---' lines) so the global
+# copy knows where the app lives.
+awk -v marker="$MARKER" -v repo="$REPO_ROOT" '
+  BEGIN { fences = 0 }
+  { print }
+  /^---[[:space:]]*$/ && fences < 2 {
+    fences++
+    if (fences == 2) {
+      print ""
+      print marker
+      print "> **Globally installed skill.** The chess app lives at:"
+      print "> `" repo "`"
+      print ">"
+      print "> Every command below is written relative to that repo root."
+      print "> Before running any of them, `cd` there (quote the path — it may"
+      print "> contain spaces):"
+      print ">"
+      print "> ```bash"
+      print "> cd \"" repo "\""
+      print "> ```"
+      print ">"
+      print "> If that directory no longer exists, tell the user the chess app"
+      print "> has moved and ask where it is now (then re-run"
+      print "> `chess-app/bin/install-skill` from its new home)."
+    }
+  }
+' "$SRC" > "$DEST"
+
+echo "installed $DEST"
+echo "  app root: $REPO_ROOT"
+echo "  /chess now works in any Claude Code session (restart running sessions to pick it up)"

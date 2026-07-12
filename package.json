@@ -1,0 +1,38 @@
+{
+  "name": "claude-chess",
+  "version": "1.0.0",
+  "description": "Play chess against Claude in a browser — local server bridged to a Claude session via tmux",
+  "keywords": [
+    "chess",
+    "claude",
+    "claude-code",
+    "ai",
+    "browser-game",
+    "tmux",
+    "cli"
+  ],
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/santiagoogaitnas/claude-chess.git"
+  },
+  "homepage": "https://github.com/santiagoogaitnas/claude-chess#readme",
+  "bugs": {
+    "url": "https://github.com/santiagoogaitnas/claude-chess/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "setup": "chess-app/bin/chess-doctor --fix",
+    "doctor": "chess-app/bin/chess-doctor",
+    "start": "chess-app/bin/chess-ctl start",
+    "stop": "chess-app/bin/chess-ctl stop",
+    "restart": "chess-app/bin/chess-ctl restart",
+    "status": "chess-app/bin/chess-ctl status",
+    "test": "npm run test:server && npm run test:e2e",
+    "test:server": "npm --prefix chess-app/server test",
+    "test:e2e": "node --test chess-app/test/*.test.mjs"
+  }
+}
