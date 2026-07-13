@@ -71,6 +71,9 @@ async function startServer() {
 }
 
 function waitExit(p, ms = 3000) {
+  // The process may already be gone — 'exit' listeners added after the fact
+  // never fire, so check first instead of racing the event.
+  if (p.exitCode !== null || p.signalCode !== null) return Promise.resolve(true);
   return new Promise((resolve) => {
     const t = setTimeout(() => resolve(false), ms);
     p.once('exit', () => { clearTimeout(t); resolve(true); });
