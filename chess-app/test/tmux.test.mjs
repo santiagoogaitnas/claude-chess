@@ -43,10 +43,11 @@ function freePort() {
 const FAKE_DIR = join(tmpdir(), `chess-tmux-test-${process.pid}`);
 const FAKE_TMUX = join(FAKE_DIR, 'tmux');
 const CAPTURE = join(FAKE_DIR, 'capture.log');
-const FAKE_SCRIPT = `#!/usr/bin/env node
-import { appendFileSync } from 'node:fs';
-appendFileSync(${JSON.stringify(CAPTURE)}, process.argv.slice(2).join(' ') + '\\n');
-process.exit(0);
+// Plain sh, not Node: an extensionless Node script needs module-syntax
+// detection to run as ESM, which Node 18 doesn't have.
+const FAKE_SCRIPT = `#!/bin/sh
+printf '%s\\n' "$*" >> '${CAPTURE}'
+exit 0
 `;
 
 // The injected `-l` payload containing `needle`: server.mjs calls
