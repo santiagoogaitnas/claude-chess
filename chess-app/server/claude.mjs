@@ -12,7 +12,9 @@
  *   node claude.mjs shutdown       # stop the server
  */
 const PORT = Number(process.env.CHESS_PORT || 3456);
-const BASE = `http://localhost:${PORT}`;
+// Dial 127.0.0.1, not localhost: the server binds IPv4 only, and on hosts that
+// resolve localhost to ::1 first, Node 18's fetch never falls back to IPv4.
+const BASE = `http://127.0.0.1:${PORT}`;
 
 // Optional: render an ASCII board locally. Degrades to FEN-only output if
 // chess.js isn't installed next to this file (server deps not yet installed).

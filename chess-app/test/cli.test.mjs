@@ -209,7 +209,7 @@ test('unknown subcommand prints usage and exits 1', async () => {
 test('unreachable server yields a clear error and exit 1', async () => {
   const { code, stderr } = await cli(['state'], 3); // nothing listens on :3
   assert.equal(code, 1);
-  assert.match(stderr, /Cannot reach chess server on http:\/\/localhost:3/);
+  assert.match(stderr, /Cannot reach chess server on http:\/\/127\.0\.0\.1:3/);
 });
 
 test('shutdown stops the server', async () => {
