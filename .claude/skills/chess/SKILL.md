@@ -1,6 +1,6 @@
 ---
 name: chess
-description: Play chess against the user in a browser UI. Launches the local chess server, receives the user's moves (via tmux injection or polling), replies with your own moves, and shuts everything down on request. Trigger on "/chess", "let's play chess", "chess game", "stop the chess game".
+description: Play chess against the user in a browser UI. Launches the local chess server, receives the user's moves (via tmux injection or a long-poll wait), replies with your own moves, and shuts everything down on request. Trigger on "/chess", "let's play chess", "chess game", "stop the chess game".
 ---
 
 # /chess — play chess with the user
@@ -32,8 +32,8 @@ and `claude.mjs` agree). All paths are relative to the repo root.
    It captures `$TMUX_PANE` automatically (so run it in the foreground, not
    via run_in_background), reuses an already-running server, waits for
    health, opens the browser, and prints the tmux target. If it prints
-   "manual mode", you are not in tmux — remember to use the §2 polling
-   fallback. On failure it prints the server log; report that to the user.
+   "manual mode", you are not in tmux — remember to use the §2 wait loop.
+   On failure it prints the server log; report that to the user.
 2. **Start a game**: ask which color the user wants if they haven't said;
    default them to white (you black):
 
@@ -56,19 +56,26 @@ and `claude.mjs` agree). All paths are relative to the repo root.
 - **Takebacks** — after an undo (§4) you may be re-prompted for a position
   you thought you already answered; that's normal. Re-run `claude.mjs state`
   and play from the position it shows, not from memory.
-- **Fallback (manual mode)** — the server sets `awaitingClaude: true` when
-  it's your move. Poll for it with a bounded loop, then play:
+- **Fallback (manual mode)** — nothing is injected; instead, ask the server
+  to hold the line until the game needs you:
 
   ```bash
-  for i in $(seq 1 60); do
-    curl -s localhost:3456/api/state | grep -q '"awaitingClaude":true' && break
-    sleep 2
-  done
+  node chess-app/server/claude.mjs wait   # your turn / a draw offer / game over
   ```
 
-  Loop: poll → think → move → poll, until the game ends or the user stops
-  you. If the poll times out (~2 min), tell the user you're still waiting on
-  their move and ask them to ping you after playing.
+  It long-polls up to ~100 s (optional arg = seconds, kept under a 120 s
+  exec timeout) and on exit 0 prints `EVENT:` and `REASON:` lines plus the
+  position. Act on the reason: `your-turn` → think properly and move (§3);
+  `draw-offer` → decide on the merits and answer per §5 (playing a move
+  also declines); `game-over` → give a closing comment, stop looping, and
+  wrap up per §6. Exit 2 means nothing happened within the budget — just
+  run `wait` again.
+
+  Loop: wait → think → move → wait, until the game ends or the user stops
+  you. If several waits in a row come back empty, tell the user you're
+  still waiting on their move and ask them to ping you after playing. On a
+  brief connection blip (exit 1), run `wait` again; if the server stays
+  unreachable, diagnose with `chess-ctl status` and `chess-ctl log`.
 
 ## 3. Making your move
 
@@ -175,7 +182,7 @@ graciously; it's a friendly game.
 - **No injected prompts arriving despite tmux** → `chess-ctl status` shows
   the pane (and flags it DEAD if gone); if it's wrong or empty, `chess-ctl
   stop` then `chess-ctl start --pane "$TMUX_PANE"`, or fall back to the §2
-  polling loop. If a single prompt was lost but the pane is fine,
+  wait loop. If a single prompt was lost but the pane is fine,
   `curl -s -X POST localhost:3456/api/nudge` re-injects the your-turn
   reminder (409 if it isn't actually your turn, or in manual mode).
 - **Server died mid-game** → `chess-ctl log` for the cause, then
@@ -183,6 +190,7 @@ graciously; it's a friendly game.
   to `chess-app/.run/game-<port>.json` and restored on startup, so the
   position, colors, and whose turn it is come back as they were. If it was
   your move when it died, the restarted server re-injects the your-turn
-  prompt (tmux mode) — just answer it; otherwise run `claude.mjs state` to
+  prompt (tmux mode; in manual mode the next `claude.mjs wait` resolves
+  immediately) — just answer it; otherwise run `claude.mjs state` to
   re-sync and continue. (Set `CHESS_RESUME=0` only if
   you deliberately want an ephemeral, non-persisted server.)

@@ -1,6 +1,6 @@
 ---
 name: chess-setup
-description: One-command setup and health check for the Claude chess app. Verifies prerequisites (node, tmux, a browser opener), installs the server dependency, optionally installs /chess globally, runs a smoke test, and tells the user exactly how to start playing. Trigger on "/chess-setup", "set up chess", "check chess setup", "get chess ready", "why won't chess start", "install chess".
+description: One-command setup and health check for the Claude chess app. Verifies prerequisites (node, a browser opener, optionally tmux), installs the server dependency, optionally installs /chess globally, runs a smoke test, and tells the user exactly how to start playing. Trigger on "/chess-setup", "set up chess", "check chess setup", "get chess ready", "why won't chess start", "install chess".
 ---
 
 # /chess-setup — get the chess app ready to play
@@ -9,11 +9,15 @@ The user wants you to make sure everything needed to play chess against Claude
 is in place — and fix or explain anything that isn't. They may not know what to
 check or which command to run; that is your job. Work through the steps below in
 order, run the checks yourself, and report a short, plain-English summary at the
-end (a checklist of ✅ / ⚠️ / ❌ with the one action needed for each ⚠️/❌).
+end (a pass/warn/fail checklist with the one action needed for each warn/fail).
 
 All commands are relative to the repo root. If this skill was installed
 globally, the installer baked the repo's absolute path into a preamble above —
 `cd` there first (quote it; the path may contain spaces).
+
+If the user just wants to play and hasn't cloned anything, `npx claude-chess`
+is the zero-setup path — it starts the server and opens the board on its own.
+The checks below are for running from a checkout of this repo.
 
 Do not ask the user questions you can answer by running a command. Only ask when
 a decision is genuinely theirs (e.g. "install /chess globally?").
@@ -26,7 +30,7 @@ gather them all so you can give the user one complete report.
 ```bash
 node --version      # need v18+ (built-in test runner + fetch used by tests)
 npm --version       # ships with node
-tmux -V             # optional but strongly recommended (enables auto move prompts)
+tmux -V             # optional nice-to-have (push mode: auto move prompts)
 git --version       # only needed if they haven't cloned yet
 [ -n "$TMUX" ] && echo "in tmux: yes" || echo "in tmux: no"  # inside a tmux session?
 ```
@@ -39,9 +43,10 @@ Interpret the results:
   - Debian/Ubuntu: `sudo apt install nodejs npm` (or use nvm / nodesource for a
     current version if the distro's is old)
   - Windows: install from <https://nodejs.org> or `winget install OpenJS.NodeJS`
-- **tmux missing** → not a blocker, but without it the server can't auto-inject
-  the user's moves into your session, so `/chess` runs in **manual polling
-  mode** (you poll `/api/state`; slightly slower turns). Offer the install hint
+- **tmux missing** → not a blocker. Without it the server can't push the
+  user's moves into your session, so `/chess` runs in **manual mode** — you
+  pull their moves with `claude.mjs wait` instead; the game plays the same,
+  tmux just keeps the chat free between moves. Offer the install hint
   (`brew install tmux` / `sudo apt install tmux`) and let them decide.
 - **Not inside tmux** (`TMUX` unset) but tmux *is* installed → for the best
   experience they should start Claude inside tmux:
@@ -49,7 +54,7 @@ Interpret the results:
   tmux new -s chess
   claude
   ```
-  Explain this is optional; without it, manual mode still works.
+  Explain this is optional; without it, manual mode works fine.
 - **A browser opener** — `chess-ctl` opens the board automatically, but only
   via `open` (macOS) or `xdg-open` (Linux) — those are the only two it calls.
   Confirm one exists for their platform; if not, the board still starts, they'll
@@ -117,7 +122,7 @@ Give the user a compact status report, then tell them exactly how to play:
 > play chess"). I'll launch the board at <http://localhost:3456>, you play
 > White, and I'll reply to your moves.
 
-If anything is still ⚠️/❌, lead with the single most important next action
+If anything is still a warn/fail, lead with the single most important next action
 (e.g. "Install Node 18+ first — everything else is ready"). Keep it short and
 friendly; the goal is that a person who didn't know what to check now knows
 exactly where they stand and what, if anything, to do next.
