@@ -8,23 +8,27 @@ or "let's play" — this file tells you exactly what to do without guessing.
 
 A browser chess app where the human plays a live Claude Code session. A local
 Node server (`chess-app/server/server.mjs`) is the referee — it validates every
-move with chess.js, serves the board UI from `web/`, and relays the human's
-moves into Claude's terminal via `tmux send-keys`. Claude replies by running a
-small CLI (`chess-app/server/claude.mjs`) that posts its move back. See
-`README.md` for the player-facing guide and `ARCHITECTURE.md` for the design.
+move with chess.js, serves the board UI from `web/`, and gets the human's move
+to Claude one of two ways: pushing it into Claude's terminal via `tmux
+send-keys`, or letting Claude pull it by long-polling `GET /api/wait` (no tmux
+needed). Claude replies by running a small CLI (`chess-app/server/claude.mjs`)
+that posts its move back. See `README.md` for the player-facing guide and
+`ARCHITECTURE.md` for the design.
 
 ## Requirements
 
 - **Node.js 18+** (built-in test runner + `fetch`). The server's only
   dependency, chess.js, auto-installs on first launch — no manual `npm install`.
-- **tmux** *(recommended)* — lets the server push the human's moves straight
-  into Claude's pane. Without it, the app runs in manual/polling mode.
+- **tmux** *(optional)* — lets the server push the human's moves straight into
+  Claude's pane so the chat stays free between moves. Without it, Claude pulls
+  each move by long-polling `GET /api/wait` (`claude.mjs wait`); everything else
+  works the same.
 - **Claude Code** — the opponent.
 
 ## If the user asks you to set things up or check their machine
 
-Run the setup checker, which reports a plain-English ✅/⚠️/❌ list and, with
-`--fix`, installs what's missing:
+Run the setup checker, which reports a plain-English pass/warn/fail list and,
+with `--fix`, installs what's missing:
 
 ```bash
 chess-app/bin/chess-doctor          # check only — what's ready, what's missing
@@ -51,15 +55,19 @@ chess-app/bin/chess-ctl stop
 chess-app/bin/chess-ctl log [n]      # tail the server log (-f follows)
 ```
 
+Outside a clone, `npx claude-chess` (`start` / `stop` / `status` / `doctor`,
+`--no-open` to skip the browser) runs the same lifecycle and shares the same
+`.run/` files.
+
 The server binds `127.0.0.1:3456` only (not exposed to the network). The
-Claude-side CLI is `node chess-app/server/claude.mjs <state|move|new|resign|draw|pgn|games|shutdown>`.
+Claude-side CLI is `node chess-app/server/claude.mjs <state|wait|move|new|resign|draw|pgn|games|shutdown>`.
 
 ## Before committing changes
 
 Run the full suite and keep it green:
 
 ```bash
-npm test        # server regression suite + api/cli/ctl/tmux/web e2e suites
+npm test        # server regression suite + api/cli/ctl/pull-loop/tmux/web e2e suites
 ```
 
 Run it in isolation — starting several servers or overlapping test runs at once

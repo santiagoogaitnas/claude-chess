@@ -34,9 +34,9 @@ That runs two things:
   (`chess-app/server/test.mjs`): move legality, turn order, persistence,
   archiving, the 64 KB body cap.
 - **`npm run test:e2e`** — the end-to-end suites in `chess-app/test/`
-  (`api`, `cli`, `ctl`, `tmux`, `web`), which drive the real HTTP API, the
-  `claude.mjs` CLI, the `chess-ctl` lifecycle, tmux move-injection, and the
-  browser board module.
+  (`api`, `cli`, `ctl`, `pull-loop`, `tmux`, `web`), which drive the real HTTP
+  API, the `claude.mjs` CLI, the `chess-ctl` lifecycle, the no-tmux pull loop,
+  tmux move-injection, and the browser board module.
 
 Run the suite **in isolation** — starting several servers or overlapping test
 runs at once can cause port/timing flakiness that is not a real failure. CI
@@ -48,8 +48,9 @@ runs at once can cause port/timing flakiness that is not a real failure. CI
   server-side with chess.js — never trust the UI. If you touch move handling,
   add or update a test in `chess-app/server/test.mjs`.
 - **Keep the API contract honest.** If you add, remove, or change an endpoint,
-  update [`chess-app/server/API.md`](chess-app/server/API.md), the README HTTP
-  API table, and `ARCHITECTURE.md` so the docs don't drift.
+  update [`chess-app/server/API.md`](chess-app/server/API.md) and
+  `ARCHITECTURE.md` so the docs don't drift (the README defers to `API.md` for
+  the full contract).
 - **The server stays local-only.** It binds `127.0.0.1:3456` and refuses
   request bodies over 64 KB. Don't expose it to the network.
 - **No new runtime dependencies** without a good reason — chess.js is
