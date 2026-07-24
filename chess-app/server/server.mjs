@@ -8,6 +8,7 @@
  *
  * Endpoints:
  *   GET  /api/state           -> full game state (fen, turn, history, status)
+ *   GET  /api/wait[?timeout=] -> long poll; answers when Claude must act (your turn / draw offer / game over) or on timeout
  *   GET  /api/moves[?square=] -> legal moves (all, or from one square) for UI hints
  *   POST /api/move            -> {move} human move (SAN or UCI); injects prompt to Claude
  *   POST /api/claude/move     -> {move} Claude's reply move
@@ -34,6 +35,11 @@ import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize } from 'node:path';
 import { Chess } from 'chess.js';
+import {
+  yourTurnPrompt, resumeReminderPrompt, nudgeReminderPrompt, newGamePrompt,
+  gameOverNotice, resignedNotice, drawOfferPrompt, drawAcceptedNotice,
+  drawDeclinedNotice, undoOpeningPrompt, undoPairNotice,
+} from './prompts.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, '..', '..', 'web');
@@ -52,7 +58,9 @@ let drawOfferBy = null; // 'w' | 'b' | null — pending draw offer
 let drawAgreed = false;
 let archived = false; // current game already appended to the archive
 let lastError = null;
+let lastEvent = null; // agent-facing one-liner for the most recent change (what /api/wait returns as event)
 const sseClients = new Set();
+const waiters = new Set(); // pending /api/wait long polls: { res, timer }
 
 // ---------- game state ----------
 function statusOf(g) {
@@ -98,6 +106,7 @@ function state() {
     drawAgreed,
     history: game.history(),
     lastError,
+    lastEvent,
     tmuxTarget: TMUX_TARGET || null,
   };
 }
@@ -134,11 +143,29 @@ function restore() {
   }
 }
 
+// ---------- /api/wait long poll ----------
+/** Why a pending /api/wait should resolve right now (null = keep holding). */
+function waitReason() {
+  if (isOver()) return 'game-over';
+  if (drawOfferBy && drawOfferBy !== claudeColor) return 'draw-offer';
+  if (awaitingClaude) return 'your-turn';
+  return null;
+}
+
+function resolveWaiter(w, reason) {
+  waiters.delete(w);
+  clearTimeout(w.timer);
+  if (w.res.writableEnded || w.res.destroyed) return; // client already gone
+  send(w.res, 200, { reason, event: reason === 'timeout' ? null : lastEvent, ...state() });
+}
+
 function broadcast() {
   if (isOver()) archiveGame();
   else archived = false; // a takeback revived an archived finish — the next finish is a new entry
   const payload = `data: ${JSON.stringify(state())}\n\n`;
   for (const res of sseClients) res.write(payload);
+  const reason = waitReason();
+  if (reason) for (const w of [...waiters]) resolveWaiter(w, reason);
   persist();
 }
 
@@ -246,29 +273,27 @@ function claudeCli(args) {
   return `${prefix}node "${CLAUDE_CLI}" ${args}`;
 }
 
-function claudePrompt(humanMove) {
-  const replyCmd = claudeCli('move <your-move>');
-  return (
-    `[chess] Opponent played ${humanMove}. ${movesSoFar()}Position (FEN): ${game.fen()}. ` +
-    `You are ${claudeColor === 'w' ? 'White' : 'Black'} and it is your turn. ` +
-    `Reply with exactly one legal move by running: ${replyCmd} ` +
-    `(SAN like Nf6 or UCI like g8f6). Game status: ${statusOf(game)}.`
-  );
-}
-
-/** Your-turn reminder with no new opponent move — used for restart resume and /api/nudge. */
-function turnReminderPrompt(lead) {
-  return (
-    `[chess] ${lead} ${movesSoFar()}Position (FEN): ${game.fen()}. ` +
-    `You are ${claudeColor === 'w' ? 'White' : 'Black'}. Reply with exactly one legal move by running: ` +
-    `${claudeCli('move <your-move>')} (SAN like Nf6 or UCI like g8f6).`
-  );
+/** Context snapshot the prompt builders in prompts.mjs render from. */
+function promptCtx() {
+  return {
+    fen: game.fen(),
+    claudeColor,
+    movetext: movesSoFar(),
+    status: statusOf(game),
+    yourTurn: game.turn() === claudeColor,
+    cli: claudeCli,
+  };
 }
 
 /** One-line game-over description, e.g. "draw (draw by threefold repetition)". */
 function gameOverText() {
   const detail = statusDetailOf(game);
   return `${statusOf(game)}${detail ? ` (${detail})` : ''}`;
+}
+
+/** Agent-facing wait event for a finished game, e.g. "Game over: checkmate — White wins". */
+function gameOverEvent() {
+  return `Game over: ${statusDetailOf(game) || statusOf(game)}`;
 }
 
 // ---------- http ----------
@@ -329,6 +354,20 @@ const server = createServer(async (req, res) => {
     }
   }
 
+  if (req.method === 'GET' && path === '/api/wait') {
+    // Long poll: hold the response open until Claude must act, else time out.
+    const raw = new URL(req.url, 'http://x').searchParams.get('timeout');
+    const requested = raw === null || Number.isNaN(Number(raw)) ? 25000 : Number(raw);
+    const timeoutMs = Math.min(120000, Math.max(1000, requested));
+    const reason = waitReason();
+    if (reason) return send(res, 200, { reason, event: lastEvent, ...state() });
+    const w = { res, timer: null };
+    w.timer = setTimeout(() => resolveWaiter(w, 'timeout'), timeoutMs);
+    waiters.add(w);
+    req.on('close', () => { clearTimeout(w.timer); waiters.delete(w); });
+    return;
+  }
+
   if (req.method === 'GET' && path === '/events') {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -353,11 +392,9 @@ const server = createServer(async (req, res) => {
     drawAgreed = false;
     archived = false;
     lastError = null;
+    lastEvent = `New game started — you are ${claudeColor === 'w' ? 'White' : 'Black'}`;
     if (awaitingClaude) {
-      await injectToClaude(
-        `[chess] New game started. You are White. Position (FEN): ${game.fen()}. ` +
-        `Make the first move by running: ${claudeCli('move <your-move>')}`
-      );
+      await injectToClaude(newGamePrompt(promptCtx()));
     }
     broadcast();
     return send(res, 200, state());
@@ -372,14 +409,12 @@ const server = createServer(async (req, res) => {
     lastError = null;
     drawOfferBy = null; // playing a move lets any pending offer lapse
     awaitingClaude = !game.isGameOver();
+    lastEvent = awaitingClaude ? `Human played ${mv.san}` : gameOverEvent();
     broadcast();
     if (awaitingClaude) {
-      injectToClaude(claudePrompt(mv.san)).then(broadcast);
+      injectToClaude(yourTurnPrompt({ ...promptCtx(), humanMove: mv.san })).then(broadcast);
     } else {
-      injectToClaude(
-        `[chess] Opponent played ${mv.san} — game over: ${gameOverText()}. ` +
-        `Final position (FEN): ${game.fen()}. No move needed; the game has ended.`
-      ).then(broadcast);
+      injectToClaude(gameOverNotice({ ...promptCtx(), humanMove: mv.san, over: gameOverText() })).then(broadcast);
     }
     return send(res, 200, state());
   }
@@ -392,12 +427,10 @@ const server = createServer(async (req, res) => {
     awaitingClaude = false;
     drawOfferBy = null;
     lastError = null;
+    lastEvent = gameOverEvent();
     broadcast();
     if (by !== claudeColor) {
-      injectToClaude(
-        `[chess] Opponent resigned — you win! Final position (FEN): ${game.fen()}. ` +
-        `The game has ended; no move needed.`
-      ).then(broadcast);
+      injectToClaude(resignedNotice(promptCtx())).then(broadcast);
     }
     return send(res, 200, state());
   }
@@ -431,13 +464,10 @@ const server = createServer(async (req, res) => {
     if (action === 'offer') {
       if (drawOfferBy) return send(res, 409, { error: 'a draw offer is already pending', ...state() });
       drawOfferBy = actor;
+      lastEvent = actor === claudeColor ? 'You offered a draw' : 'Opponent offers a draw';
       broadcast();
       if (actor !== claudeColor) {
-        injectToClaude(
-          `[chess] Opponent offers a draw. Position (FEN): ${game.fen()}. ` +
-          `Accept with: ${claudeCli('draw accept')} — or decline with: ` +
-          `${claudeCli('draw decline')} (or simply play your move${game.turn() === claudeColor ? '' : ' when it is your turn'}, which declines).`
-        ).then(broadcast);
+        injectToClaude(drawOfferPrompt(promptCtx())).then(broadcast);
       }
       return send(res, 200, state());
     }
@@ -450,21 +480,17 @@ const server = createServer(async (req, res) => {
         drawOfferBy = null;
         awaitingClaude = false;
         lastError = null;
+        lastEvent = gameOverEvent();
         broadcast();
         if (actor !== claudeColor) {
-          injectToClaude(
-            `[chess] Opponent accepted your draw offer — the game is drawn by agreement. ` +
-            `Final position (FEN): ${game.fen()}. No move needed.`
-          ).then(broadcast);
+          injectToClaude(drawAcceptedNotice(promptCtx())).then(broadcast);
         }
       } else {
         drawOfferBy = null;
+        lastEvent = actor === claudeColor ? 'You declined the draw offer' : 'Opponent declined your draw offer';
         broadcast();
         if (actor !== claudeColor) {
-          injectToClaude(
-            `[chess] Opponent declined your draw offer — play continues. Position (FEN): ${game.fen()}.` +
-            (game.turn() === claudeColor ? ' It is your turn.' : ' Wait for their move.')
-          ).then(broadcast);
+          injectToClaude(drawDeclinedNotice(promptCtx())).then(broadcast);
         }
       }
       return send(res, 200, state());
@@ -487,18 +513,13 @@ const server = createServer(async (req, res) => {
     if (game.turn() === claudeColor) {
       // Only Claude's opening move existed; it's Claude's turn again.
       awaitingClaude = true;
+      lastEvent = 'Opponent took back your opening move';
       broadcast();
-      injectToClaude(
-        `[chess] Opponent took back your opening move. Position (FEN): ${game.fen()}. ` +
-        `You are ${claudeColor === 'w' ? 'White' : 'Black'}; play your move again via: ` +
-        `${claudeCli('move <your-move>')}`
-      ).then(broadcast);
+      injectToClaude(undoOpeningPrompt(promptCtx())).then(broadcast);
     } else {
+      lastEvent = 'Opponent took back the last move pair';
       broadcast();
-      injectToClaude(
-        `[chess] Opponent took back the last move pair. Position (FEN): ${game.fen()}. ` +
-        `It is their turn; wait for their next move.`
-      ).then(broadcast);
+      injectToClaude(undoPairNotice(promptCtx())).then(broadcast);
     }
     return send(res, 200, state());
   }
@@ -507,9 +528,7 @@ const server = createServer(async (req, res) => {
     if (isOver()) return send(res, 409, { error: 'game over', ...state() });
     if (!awaitingClaude) return send(res, 409, { error: 'not waiting for Claude — nothing to nudge', ...state() });
     if (!TMUX_TARGET) return send(res, 409, { error: 'no tmux target configured (manual mode)', ...state() });
-    const ok = await injectToClaude(
-      turnReminderPrompt('Reminder — it is still your turn (the previous prompt may have been lost).')
-    );
+    const ok = await injectToClaude(nudgeReminderPrompt(promptCtx()));
     broadcast();
     if (!ok) return send(res, 502, { error: lastError || 'tmux inject failed', ...state() });
     lastError = null;
@@ -525,6 +544,7 @@ const server = createServer(async (req, res) => {
     awaitingClaude = false;
     drawOfferBy = null; // playing a move lets any pending offer lapse
     lastError = null;
+    lastEvent = game.isGameOver() ? gameOverEvent() : `You played ${mv.san}`;
     broadcast();
     return send(res, 200, state());
   }
@@ -547,8 +567,6 @@ server.listen(PORT, '127.0.0.1', () => {
   // If we resumed a game where Claude owed a move, the pre-restart prompt is
   // gone with the old process — re-inject it so the game doesn't stall.
   if (awaitingClaude && !isOver() && TMUX_TARGET) {
-    injectToClaude(
-      turnReminderPrompt('Game resumed after a server restart — it is still your turn.')
-    ).then(broadcast);
+    injectToClaude(resumeReminderPrompt(promptCtx())).then(broadcast);
   }
 });

@@ -121,6 +121,7 @@ test('fresh state has the documented shape and defaults', async () => {
   assert.equal(body.drawAgreed, false);
   assert.deepEqual(body.history, []);
   assert.equal(body.lastError, null);
+  assert.equal(body.lastEvent, null);
   assert.equal(body.tmuxTarget, null);
   assert.equal(typeof body.pgn, 'string');
 });
@@ -415,6 +416,141 @@ test('GET / serves the web UI', async () => {
 test('static handler blocks path traversal out of web/', async () => {
   const res = await fetch(BASE + '/%2e%2e/chess-app/server/server.mjs');
   assert.notEqual(res.status, 200);
+});
+
+test('/api/wait resolves immediately when a move is already owed', async () => {
+  await post('/api/new', { claudeColor: 'w' }); // Claude opens — your-turn already holds
+  const t0 = Date.now();
+  const { status, body } = await get('/api/wait?timeout=8000');
+  assert.equal(status, 200);
+  assert.ok(Date.now() - t0 < 3000, 'must not long-poll when the condition already holds');
+  assert.equal(body.reason, 'your-turn');
+  assert.equal(body.event, 'New game started — you are White');
+  assert.equal(body.awaitingClaude, true);
+  assert.equal(body.fen, START_FEN);
+});
+
+test('/api/wait long-polls until the human moves', async () => {
+  await post('/api/new', { claudeColor: 'b' }); // human to move — nothing owed yet
+  const t0 = Date.now();
+  const pending = get('/api/wait?timeout=15000');
+  await new Promise((r) => setTimeout(r, 300));
+  await post('/api/move', { move: 'e4' });
+  const { status, body } = await pending;
+  assert.equal(status, 200);
+  assert.equal(body.reason, 'your-turn');
+  assert.equal(body.event, 'Human played e4');
+  assert.ok(Date.now() - t0 >= 250, 'resolved before the human move landed');
+  assert.deepEqual(body.history, ['e4']);
+  assert.equal(body.awaitingClaude, true);
+});
+
+test('/api/wait resolves with draw-offer when the human offers', async () => {
+  await post('/api/new', { claudeColor: 'b' });
+  const pending = get('/api/wait?timeout=15000');
+  await new Promise((r) => setTimeout(r, 200));
+  await post('/api/draw'); // defaults: by human, action offer
+  const { body } = await pending;
+  assert.equal(body.reason, 'draw-offer');
+  assert.equal(body.event, 'Opponent offers a draw');
+  assert.equal(body.drawOfferBy, 'w');
+  await post('/api/draw', { by: 'claude', action: 'decline' });
+});
+
+test('/api/wait resolves with game-over and answers instantly once ended', async () => {
+  await post('/api/new', { claudeColor: 'b' });
+  const pending = get('/api/wait?timeout=15000');
+  await new Promise((r) => setTimeout(r, 200));
+  await post('/api/resign'); // human resigns
+  const { body } = await pending;
+  assert.equal(body.reason, 'game-over');
+  assert.equal(body.event, 'Game over: White resigned');
+  assert.equal(body.gameOver, true);
+  const t0 = Date.now();
+  const again = await get('/api/wait?timeout=8000');
+  assert.equal(again.body.reason, 'game-over');
+  assert.ok(Date.now() - t0 < 3000, 'wait after game over must not hold');
+});
+
+test('/api/wait reports mate with the game-over event detail', async () => {
+  await post('/api/new', { claudeColor: 'b' });
+  await post('/api/move', { move: 'e4' });
+  await post('/api/claude/move', { move: 'e5' });
+  await post('/api/move', { move: 'Qh5' });
+  await post('/api/claude/move', { move: 'Nc6' });
+  await post('/api/move', { move: 'Bc4' });
+  await post('/api/claude/move', { move: 'Rb8' });
+  const pending = get('/api/wait?timeout=15000');
+  await new Promise((r) => setTimeout(r, 200));
+  const mate = await post('/api/move', { move: 'Qxf7#' }); // scholar's mate
+  assert.equal(mate.status, 200);
+  const { body } = await pending;
+  assert.equal(body.reason, 'game-over');
+  assert.equal(body.event, 'Game over: checkmate — White wins');
+  assert.equal(body.gameOver, true);
+});
+
+test('/api/wait times out with a clamped floor and a null event', async () => {
+  await post('/api/new', { claudeColor: 'b' }); // human to move — nothing owed
+  const t0 = Date.now();
+  const { status, body } = await get('/api/wait?timeout=1');
+  const held = Date.now() - t0;
+  assert.equal(status, 200);
+  assert.equal(body.reason, 'timeout');
+  assert.equal(body.event, null); // a timeout reports no event…
+  assert.equal(body.lastEvent, 'New game started — you are Black'); // …but state keeps the last one
+  assert.ok(held >= 950, `held only ${held}ms — timeout must clamp up to 1000ms`);
+  assert.ok(held < 20000, `held ${held}ms — clamp ignored (default would be 25000ms)`);
+});
+
+test('/api/wait drops a waiter whose client disconnects', async () => {
+  const controller = new AbortController();
+  const aborted = fetch(BASE + '/api/wait?timeout=30000', { signal: controller.signal })
+    .catch(() => null); // the AbortError is the point
+  await new Promise((r) => setTimeout(r, 200));
+  controller.abort();
+  await aborted;
+  await new Promise((r) => setTimeout(r, 100)); // let the server process the close
+  // The next state change must not trip over the dead waiter.
+  const move = await post('/api/move', { move: 'e4' });
+  assert.equal(move.status, 200);
+  const { status, body } = await get('/api/state');
+  assert.equal(status, 200);
+  assert.equal(body.lastError, null);
+  await post('/api/claude/move', { move: 'e5' });
+});
+
+test('/api/wait resolves every concurrent waiter on the same event', async () => {
+  // Board: e4 e5 from the previous test — human to move.
+  const waiters = [
+    get('/api/wait?timeout=15000'),
+    get('/api/wait?timeout=15000'),
+    get('/api/wait?timeout=15000'),
+  ];
+  await new Promise((r) => setTimeout(r, 300));
+  await post('/api/move', { move: 'Nf3' });
+  const results = await Promise.all(waiters);
+  for (const r of results) {
+    assert.equal(r.status, 200);
+    assert.equal(r.body.reason, 'your-turn');
+    assert.equal(r.body.event, 'Human played Nf3');
+  }
+});
+
+test('/api/wait releases on an opening takeback with the rewound state', async () => {
+  await post('/api/new', { claudeColor: 'w' });
+  await post('/api/claude/move', { move: 'd4' }); // Claude opens; human to move
+  const pending = get('/api/wait?timeout=15000');
+  await new Promise((r) => setTimeout(r, 200));
+  const undo = await post('/api/undo'); // human takes back Claude's opening move
+  assert.equal(undo.status, 200);
+  const { body } = await pending;
+  assert.equal(body.reason, 'your-turn');
+  assert.equal(body.event, 'Opponent took back your opening move');
+  assert.deepEqual(body.history, []);
+  assert.equal(body.fen, START_FEN);
+  assert.equal(body.awaitingClaude, true);
+  await post('/api/new', { claudeColor: 'b' }); // clean board for the tests below
 });
 
 test('game state survives a server restart via .run/game.json', async () => {

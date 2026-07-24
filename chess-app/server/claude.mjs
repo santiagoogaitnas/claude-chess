@@ -3,6 +3,7 @@
  * CLI for Claude's side of the board. Talks to the local chess server.
  *
  *   node claude.mjs state          # print current position
+ *   node claude.mjs wait [seconds] # block until your turn / a draw offer / game over (exit 2 = still waiting)
  *   node claude.mjs move Nf6       # play a move (SAN or UCI)
  *   node claude.mjs new [w|b]      # new game, optional Claude color
  *   node claude.mjs resign         # resign the game as Claude
@@ -44,6 +45,27 @@ try {
   if (cmd === 'state') {
     const { data } = await api('GET', '/api/state');
     printState(data);
+  } else if (cmd === 'wait') {
+    // Long-poll /api/wait in <=25s slices until something needs Claude or the
+    // budget runs out. Exit 0 = act on REASON; exit 2 = still nothing, wait again.
+    const budget = Number(arg) > 0 ? Number(arg) : 100; // seconds — stays under a 120s exec timeout
+    const deadline = Date.now() + budget * 1000;
+    for (let left = budget * 1000; left > 0; left = deadline - Date.now()) {
+      const { ok, data } = await api('GET', `/api/wait?timeout=${Math.max(1000, Math.min(25000, left))}`);
+      // A reply without ok+reason is not a wait event — something other than
+      // an up-to-date chess server answered (older build, foreign service).
+      if (!ok || !data.reason) {
+        console.error(`Unexpected response from ${BASE}/api/wait — is an up-to-date chess server running? (${JSON.stringify(data).slice(0, 200)})`);
+        process.exit(1);
+      }
+      if (data.reason === 'timeout') continue;
+      console.log(`EVENT: ${data.event ?? '(none)'}`);
+      console.log(`REASON: ${data.reason}`);
+      printState(data);
+      process.exit(0);
+    }
+    console.log(`Still waiting after ${budget}s — nothing happened yet. Run wait again to keep listening.`);
+    process.exit(2);
   } else if (cmd === 'move') {
     if (!arg) { console.error('usage: claude.mjs move <san-or-uci>'); process.exit(1); }
     const { ok, data } = await api('POST', '/api/claude/move', { move: arg });
@@ -82,6 +104,7 @@ try {
     console.log('Server stopped.');
   } else {
     console.error('usage: claude.mjs <state|move|new|resign|draw|pgn|games|shutdown> [arg]');
+    console.error('   or: claude.mjs wait [seconds]  # long-poll until your turn / a draw offer / game over');
     process.exit(1);
   }
 } catch (e) {

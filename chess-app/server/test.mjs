@@ -168,6 +168,79 @@ try {
   r = await api('GET', '/api/state');
   check('server healthy after oversized body', r.code === 200 && r.data.drawAgreed === true, r.data);
 
+  console.log('wait long poll');
+  {
+    // fresh game with Claude = White: a move is already owed, wait resolves at once
+    await api('POST', '/api/new', { claudeColor: 'w' });
+    let t0 = Date.now();
+    r = await api('GET', '/api/wait?timeout=8000');
+    check('wait resolves immediately when a move is owed', r.code === 200 && r.data.reason === 'your-turn' && Date.now() - t0 < 3000, r.data);
+    check('wait event describes the new game', r.data.event === 'New game started — you are White', r.data.event);
+    check('state exposes lastEvent', r.data.lastEvent === 'New game started — you are White', r.data.lastEvent);
+
+    // a pending human draw offer outranks your-turn
+    await api('POST', '/api/draw', { by: 'human' });
+    r = await api('GET', '/api/wait?timeout=8000');
+    check('pending human draw offer outranks your-turn', r.data.reason === 'draw-offer' && r.data.event === 'Opponent offers a draw', r.data);
+    await api('POST', '/api/draw', { by: 'claude', action: 'decline' });
+
+    // held open until the human moves
+    await api('POST', '/api/claude/move', { move: 'e4' });
+    let pending = api('GET', '/api/wait?timeout=15000');
+    await new Promise((rs) => setTimeout(rs, 200));
+    await api('POST', '/api/move', { move: 'e5' });
+    r = await pending;
+    check('wait resolves on the human move', r.code === 200 && r.data.reason === 'your-turn' && r.data.event === 'Human played e5', r.data);
+
+    // timeout: nothing owed after Claude replies; floor clamps ?timeout=1 to ~1s
+    await api('POST', '/api/claude/move', { move: 'Nf3' });
+    t0 = Date.now();
+    r = await api('GET', '/api/wait?timeout=1');
+    const held = Date.now() - t0;
+    check('wait times out with reason timeout and null event', r.data.reason === 'timeout' && r.data.event === null, r.data);
+    check('timeout clamped to the 1s floor', held >= 950 && held < 10000, held);
+
+    // every concurrent waiter resolves on the same event
+    const w1 = api('GET', '/api/wait?timeout=15000');
+    const w2 = api('GET', '/api/wait?timeout=15000');
+    await new Promise((rs) => setTimeout(rs, 200));
+    await api('POST', '/api/move', { move: 'Nc6' });
+    const both = await Promise.all([w1, w2]);
+    check('multiple waiters all resolve', both.every((w) => w.data.reason === 'your-turn' && w.data.event === 'Human played Nc6'), both.map((w) => w.data.reason));
+
+    // a disconnected waiter is dropped; later broadcasts must not trip on it
+    await api('POST', '/api/claude/move', { move: 'Bc4' });
+    const ac = new AbortController();
+    const gone = fetch(`${BASE}/api/wait?timeout=30000`, { signal: ac.signal }).catch(() => null);
+    await new Promise((rs) => setTimeout(rs, 200));
+    ac.abort();
+    await gone;
+    await new Promise((rs) => setTimeout(rs, 100));
+    await api('POST', '/api/move', { move: 'd6' });
+    r = await api('GET', '/api/state');
+    check('server healthy after a waiter disconnects', r.code === 200 && r.data.lastError === null, r.data);
+
+    // an opening takeback re-owes the move and releases the waiter
+    await api('POST', '/api/new', { claudeColor: 'w' });
+    await api('POST', '/api/claude/move', { move: 'd4' });
+    pending = api('GET', '/api/wait?timeout=15000');
+    await new Promise((rs) => setTimeout(rs, 200));
+    await api('POST', '/api/undo');
+    r = await pending;
+    check('opening takeback releases the waiter with fresh state', r.data.reason === 'your-turn' && r.data.event === 'Opponent took back your opening move' && r.data.history.length === 0 && r.data.awaitingClaude === true, r.data);
+
+    // game over releases pending waiters and answers later waits instantly
+    await api('POST', '/api/claude/move', { move: 'e4' });
+    pending = api('GET', '/api/wait?timeout=15000');
+    await new Promise((rs) => setTimeout(rs, 200));
+    await api('POST', '/api/resign', {});
+    r = await pending;
+    check('game over releases the waiter', r.data.reason === 'game-over' && r.data.event === 'Game over: Black resigned', r.data);
+    t0 = Date.now();
+    r = await api('GET', '/api/wait?timeout=8000');
+    check('wait after game over returns immediately', r.data.reason === 'game-over' && Date.now() - t0 < 3000, r.data);
+  }
+
   console.log('shutdown');
   r = await api('POST', '/api/shutdown');
   check('shutdown ok', r.code === 200 && r.data.ok === true, r.data);
