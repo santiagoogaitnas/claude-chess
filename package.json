@@ -1,7 +1,7 @@
 {
   "name": "claude-chess",
-  "version": "1.0.0",
-  "description": "Play chess against Claude in a browser — local server bridged to a Claude session via tmux",
+  "version": "1.1.0",
+  "description": "Play chess against Claude in your browser — a small local server referees; the agent is the opponent",
   "keywords": [
     "chess",
     "claude",
@@ -11,7 +11,9 @@
     "tmux",
     "cli"
   ],
-  "private": true,
+  "bin": {
+    "claude-chess": "chess-app/bin/cli.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/santiagoogaitnas/claude-chess.git"
@@ -24,6 +26,21 @@
   "engines": {
     "node": ">=18"
   },
+  "dependencies": {
+    "chess.js": "^1.4.0"
+  },
+  "files": [
+    "chess-app/bin",
+    "chess-app/server/*.mjs",
+    "chess-app/server/*.md",
+    "chess-app/server/*.json",
+    "web",
+    ".claude/skills",
+    "ARCHITECTURE.md",
+    "CLAUDE.md",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "setup": "chess-app/bin/chess-doctor --fix",
     "doctor": "chess-app/bin/chess-doctor",

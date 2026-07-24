@@ -97,18 +97,17 @@ else
   warn "curl not found — chess-ctl uses it to confirm the server is up"
 fi
 
-# tmux — enables live move injection into Claude's pane. Without it, manual mode.
+# tmux — OPTIONAL. Inside a session the server pushes your moves into Claude's
+# pane; without it Claude pulls each move by long-polling (claude.mjs wait).
+# Both transports work, so a missing tmux is never a blocker — never a warning.
 if command -v tmux >/dev/null 2>&1; then
   if [ -n "${TMUX:-}" ]; then
-    pass "tmux — and you're inside a session (live move injection available)"
+    pass "tmux — inside a session (your moves are pushed to Claude automatically)"
   else
-    warn "tmux installed but this shell is NOT inside a session"
-    info "Start one so Claude gets your moves automatically:  tmux new -s chess"
-    info "(without tmux, /chess falls back to manual polling mode — still works)"
+    pass "tmux available (optional — run 'tmux new -s chess' to push moves; otherwise Claude pulls)"
   fi
 else
-  warn "tmux not found — /chess will run in manual-polling mode"
-  info "For hands-free move relay:  brew install tmux   (then: tmux new -s chess)"
+  info "tmux not found — optional; Claude pulls moves by long-polling (pull mode), which works fine"
 fi
 
 # browser opener — chess-ctl auto-opens the board with `open`/`xdg-open`.
@@ -182,7 +181,7 @@ else
   printf '%s✓ Everything looks good — ready to play!%s\n' "$G" "$Z"
 fi
 printf '\nStart a game:\n'
-printf '  • In a Claude session (inside tmux):  say  %s/chess%s\n' "$B" "$Z"
-printf '  • Or manually:                        chess-app/bin/chess-ctl start\n'
+printf '  • In a Claude session:  say  %s/chess%s   (tmux optional)\n' "$B" "$Z"
+printf '  • Or from a terminal:   chess-app/bin/chess-ctl start   (or: npx claude-chess)\n'
 printf '  Then open  http://localhost:%s\n' "$PORT"
 exit 0

@@ -193,7 +193,7 @@ cmd_start() {
     fi
   else
     echo "warning: not inside tmux and no --pane given — starting in manual mode" >&2
-    echo "         (moves won't be injected into Claude; use 'node $APP_DIR/server/claude.mjs state' to poll)" >&2
+    echo "         (moves won't be injected into Claude; run 'node $APP_DIR/server/claude.mjs wait' to long-poll for your turn)" >&2
   fi
 
   mkdir -p "$RUN_DIR"
@@ -216,8 +216,13 @@ cmd_start() {
       "CHESS_PORT='$PORT' CHESS_TMUX_TARGET='$pane' CHESS_RESUME='${CHESS_RESUME:-1}' exec node '$APP_DIR/server/server.mjs' >> '$LOG_FILE' 2>&1"
     tmux display-message -pt "$sess" '#{pane_pid}' > "$PID_FILE"
   else
-    CHESS_PORT="$PORT" CHESS_TMUX_TARGET="$pane" \
-      nohup node "$APP_DIR/server/server.mjs" >> "$LOG_FILE" 2>&1 &
+    # no tmux (or it failed to start): run the server detached with just a
+    # pidfile, mirroring bin/cli.mjs. nohup execs node in place so $! is the
+    # server's pid; </dev/null unties its stdin from this shell so a caller that
+    # reaps its background children can't take the server with it. An empty pane
+    # file (written above) or a missing one both read as manual mode below.
+    CHESS_PORT="$PORT" CHESS_TMUX_TARGET="$pane" CHESS_RESUME="${CHESS_RESUME:-1}" \
+      nohup node "$APP_DIR/server/server.mjs" >> "$LOG_FILE" 2>&1 </dev/null &
     echo $! > "$PID_FILE"
   fi
 

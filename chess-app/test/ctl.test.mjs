@@ -15,10 +15,13 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import {
   mkdtempSync,
+  mkdirSync,
   cpSync,
   symlinkSync,
   existsSync,
   readFileSync,
+  writeFileSync,
+  chmodSync,
   rmSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -45,13 +48,14 @@ async function distinctPorts(n) {
   while (ports.size < n) ports.add(await freePort());
   return [...ports];
 }
-const [PORT_A, PORT_B, PORT_FOREIGN, PORT_INJECT] = await distinctPorts(4);
+const [PORT_A, PORT_B, PORT_FOREIGN, PORT_INJECT, PORT_NOTMUX] = await distinctPorts(5);
 
 let root; // temp copy of the repo layout
 let ctl;
 let runDir;
 let foreignProc = null;
 let injectProc = null;
+let notmuxPid = 0; // fallback (no-tmux) server pid, reaped in after() if it leaks
 const INJECT_SESSION = `chess-inject-test-${PORT_INJECT}`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -111,6 +115,7 @@ before(() => {
 after(async () => {
   if (foreignProc && foreignProc.exitCode === null) foreignProc.kill('SIGKILL');
   if (injectProc && injectProc.exitCode === null) injectProc.kill('SIGKILL');
+  if (notmuxPid) { try { process.kill(notmuxPid, 'SIGKILL'); } catch { /* already gone */ } }
   spawnSync('tmux', ['kill-session', '-t', INJECT_SESSION]);
   runCtl(['stop']);
   for (const p of [PORT_A, PORT_B, PORT_FOREIGN]) {
@@ -186,6 +191,57 @@ test('stop shuts down the server and cleans all state files', async () => {
   const status = runCtl(['status']);
   assert.notEqual(status.code, 0);
   assert.match(status.out, /not running/);
+});
+
+// No-tmux fallback: when tmux is unavailable, start must still boot the server
+// as a plain detached process (pidfile + log, no tmux session), and stop/status
+// must manage that pidfile-started server — including with no pane file at all,
+// which is how bin/cli.mjs starts it.
+test('start falls back to a detached node server when tmux is unavailable', async () => {
+  // Shadow tmux with a stub that always fails so chess-ctl takes the no-tmux
+  // path even here / on CI where tmux is installed.
+  const fakeBin = join(root, 'fakebin');
+  mkdirSync(fakeBin, { recursive: true });
+  const stub = join(fakeBin, 'tmux');
+  writeFileSync(stub, '#!/bin/sh\nexit 1\n');
+  chmodSync(stub, 0o755);
+  const env = { PATH: `${fakeBin}:${process.env.PATH}` };
+
+  const { code, out, err } = runCtl(
+    ['start', '--port', String(PORT_NOTMUX), '--no-open'],
+    env
+  );
+  assert.equal(code, 0, `stderr: ${err}`);
+  assert.match(out, new RegExp(`chess server up: http://127\\.0\\.0\\.1:${PORT_NOTMUX}`));
+  assert.match(out, /manual mode/);
+  assert.ok(await apiUp(PORT_NOTMUX), 'fallback server should answer the API');
+
+  const pid = Number(readFileSync(join(runDir, 'server.pid'), 'utf8'));
+  notmuxPid = pid;
+  assert.ok(pid > 0 && !Number.isNaN(pid), 'pidfile should hold a real pid');
+  assert.equal(readFileSync(join(runDir, 'port'), 'utf8'), String(PORT_NOTMUX));
+  assert.ok(
+    !tmuxSessionExists(`chess-server-${PORT_NOTMUX}`),
+    'the fallback must not create a chess-server tmux session'
+  );
+
+  // Simulate a server started with NO pane file (how cli.mjs starts it):
+  // stop/status must still recognize and manage it.
+  rmSync(join(runDir, 'pane'), { force: true });
+
+  const st = runCtl(['status'], env);
+  assert.equal(st.code, 0, `stderr: ${st.err}`);
+  assert.match(st.out, new RegExp(`running \\(pid ${pid}\\)`));
+  assert.match(st.out, /manual mode/);
+
+  const sp = runCtl(['stop'], env);
+  assert.equal(sp.code, 0, `stderr: ${sp.err}`);
+  assert.match(sp.out, /chess server stopped/);
+  assert.ok(await waitFor(async () => !(await apiUp(PORT_NOTMUX))), 'fallback server should stop');
+  for (const f of ['server.pid', 'port', 'pane']) {
+    assert.ok(!existsSync(join(runDir, f)), `${f} should be removed`);
+  }
+  notmuxPid = 0;
 });
 
 test('start refuses a port already held by a server it did not launch', async () => {
